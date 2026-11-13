@@ -1,0 +1,435 @@
+--[[
+    Деобфусцированная версия obfuscated.lua
+
+    Что это: загрузчик (loader) Luarmor для Roblox-скрипта "Aurora" (极光计划).
+    Оригинал был упакован в собственную виртуальную машину (стековый байткод,
+    3095 инструкций, 286 обработчиков опкодов, зашифрованные константы) и
+    дополнительно "расплющен" автоматом состояний на трёх уровнях.
+
+    Имена переменных мои — в байткоде имён нет. Логика, константы и порядок
+    действий восстановлены из байткода и сверены прогоном оригинала в песочнице
+    (см. отчёт). Машинный (не причёсанный) вывод декомпилятора лежит рядом:
+    deobfuscated_raw.lua.
+
+    Файл состоит из двух частей:
+      1. проверки окружения, которые добавил сам обфускатор (анти-тампер);
+      2. собственно скрипт — он целиком внутри xpcall(...) в конце файла.
+]]
+
+-- В оригинале это отдельная инструкция VM: она стирает таблицы виртуальной
+-- машины и навсегда зависает (бесконечный цикл / бесконечный yield в корутине).
+local function ANTI_TAMPER_TRAP()
+	while true do end
+end
+
+--==========================================================================--
+-- ЧАСТЬ 1. Анти-тампер обфускатора: проверка, что базовые функции Lua
+-- (pcall, error, type, select, rawequal, next, pairs, ipairs, rawget,
+-- getmetatable, setmetatable) настоящие и ведут себя как положено.
+--==========================================================================--
+
+local pcall_, error_, type_, select_, rawequal_ = pcall, error, type, select, rawequal
+if type_(pcall_) ~= "function" or type_(error_) ~= "function"
+	or type_(select_) ~= "function" or type_(rawequal_) ~= "function" then
+	return ANTI_TAMPER_TRAP()
+end
+
+local MAGIC = 240925
+if (MAGIC * 21 + 28) % 65521 ~= 14336 then -- арифметика не подменена
+	return ANTI_TAMPER_TRAP()
+end
+
+local SENTINEL = {}
+if not rawequal_(SENTINEL, SENTINEL) or rawequal_(SENTINEL, {}) then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- pcall обязан прозрачно передать аргументы и вернуть (true, SENTINEL, nil, MAGIC)
+local function pcallResultOk(...)
+	return select_("#", ...) == 4
+		and (...) == true
+		and rawequal_(select_(2, ...), SENTINEL)
+		and select_(3, ...) == nil
+		and select_(4, ...) == MAGIC
+end
+if not pcallResultOk(pcall_(function(...)
+	if select_("#", ...) ~= 3 or (...) ~= MAGIC
+		or select_(2, ...) ~= nil or not rawequal_(select_(3, ...), SENTINEL) then
+		return false
+	end
+	return SENTINEL, nil, MAGIC
+end, MAGIC, nil, SENTINEL)) then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- error(obj, 0) через pcall обязан вернуть (false, тот же объект)
+local ok, err = pcall_(error_, SENTINEL, 0)
+if ok ~= false or not rawequal_(err, SENTINEL) then
+	return ANTI_TAMPER_TRAP()
+end
+
+local next_, pairs_, ipairs_ = next, pairs, ipairs
+local rawget_, getmetatable_, setmetatable_ = rawget, getmetatable, setmetatable
+if type_(next_) ~= "function" or type_(pairs_) ~= "function" or type_(ipairs_) ~= "function"
+	or type_(rawget_) ~= "function" or type_(getmetatable_) ~= "function"
+	or type_(setmetatable_) ~= "function" then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- Ловушки: если "сырые" функции вдруг дёрнут метаметоды — значит они подменены
+local metamethodFired = false
+local function guard()
+	metamethodFired = true
+	return "guard"
+end
+
+local eqMeta = { __eq = function()
+	metamethodFired = true
+	return true
+end }
+local a, b = setmetatable_({}, eqMeta), setmetatable_({}, eqMeta)
+if rawequal_(a, b) or not rawequal_(a, a) or metamethodFired then
+	return ANTI_TAMPER_TRAP()
+end
+
+local guardMeta = { __index = guard, __tostring = guard }
+local probe = setmetatable_({ [SENTINEL] = MAGIC, [MAGIC] = false }, guardMeta)
+if not rawequal_(getmetatable_(probe), guardMeta)
+	or rawget_(probe, SENTINEL) ~= MAGIC
+	or rawget_(probe, MAGIC) ~= false
+	or rawget_(probe, "missing") ~= nil then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- next / pairs обязаны обойти probe ровно по двум его парам
+local function iteratesProbe(iter, state, ctl)
+	local k1, v1 = iter(state, ctl)
+	if not (rawequal_(k1, SENTINEL) and v1 == MAGIC or k1 == MAGIC and v1 == false) then
+		return false
+	end
+	local k2, v2 = iter(state, k1)
+	if rawequal_(k2, k1)
+		or not (rawequal_(k2, SENTINEL) and v2 == MAGIC or k2 == MAGIC and v2 == false) then
+		return false
+	end
+	return iter(state, k2) == nil
+end
+
+local res, iter, state, ctl
+ok, res = pcall_(iteratesProbe, next_, probe, nil)
+if not ok or not res then
+	return ANTI_TAMPER_TRAP()
+end
+ok, iter, state, ctl = pcall_(pairs_, probe)
+if not ok or type_(iter) ~= "function" or not rawequal_(state, probe) or ctl ~= nil then
+	return ANTI_TAMPER_TRAP()
+end
+ok, res = pcall_(iteratesProbe, iter, state, ctl)
+if not ok or not res then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- ipairs обязан выдать (1, MAGIC), (2, false) и остановиться на nil
+local arrProbe = setmetatable_({ MAGIC, false, nil, SENTINEL }, { __tostring = guard })
+ok, iter, state, ctl = pcall_(ipairs_, arrProbe)
+if not ok or type_(iter) ~= "function" or not rawequal_(state, arrProbe) or ctl ~= 0 then
+	return ANTI_TAMPER_TRAP()
+end
+ok, res = pcall_(function()
+	local i, v = iter(state, ctl)
+	if i ~= 1 or v ~= MAGIC then
+		return false
+	end
+	i, v = iter(state, i)
+	if i ~= 2 or v ~= false then
+		return false
+	end
+	return iter(state, i) == nil
+end)
+if not ok or not res or metamethodFired then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- Окружение: _ENV (в Lua 5.2+) либо getfenv() (в Lua 5.1 / Luau)
+local env, getfenv_ = _ENV, getfenv
+if getfenv_ ~= nil then
+	if type_(getfenv_) ~= "function" then
+		return ANTI_TAMPER_TRAP()
+	end
+	local envBefore = env
+	ok, env = pcall_(function()
+		return getfenv_()
+	end)
+	if not ok or type_(envBefore) == "table" and not rawequal_(env, envBefore) then
+		return ANTI_TAMPER_TRAP()
+	end
+end
+if type_(env) ~= "table" then
+	return ANTI_TAMPER_TRAP()
+end
+
+-- Цепочка метатаблиц окружения (__index / __newindex) должна состоять только
+-- из таблиц и быть не длиннее 64 звеньев (т.е. без функций-перехватчиков)
+local queue, visited, idx = { env }, {}, 1
+while idx <= #queue do
+	if idx > 64 then
+		return ANTI_TAMPER_TRAP()
+	end
+	local tbl = queue[idx]
+	idx = idx + 1
+	if not visited[tbl] then
+		visited[tbl] = true
+		local mt = getmetatable_(tbl)
+		if type_(mt) == "table" then
+			local mtIndex, mtNewindex = rawget_(mt, "__index"), rawget_(mt, "__newindex")
+			if mtIndex ~= nil then
+				if type_(mtIndex) ~= "table" then
+					return ANTI_TAMPER_TRAP()
+				end
+				queue[#queue + 1] = mtIndex
+			end
+			if mtNewindex ~= nil then
+				if type_(mtNewindex) ~= "table" then
+					return ANTI_TAMPER_TRAP()
+				end
+				queue[#queue + 1] = mtNewindex
+			end
+		end
+	end
+end
+
+-- Глобальные pcall/error/... в окружении должны быть теми же функциями,
+-- что были захвачены в самом начале
+local names = { "pcall", "error", "type", "select", "rawequal", "next", "pairs", "ipairs",
+	"rawget", "getmetatable", "setmetatable" }
+local funcs = { pcall_, error_, type_, select_, rawequal_, next_, pairs_, ipairs_,
+	rawget_, getmetatable_, setmetatable_ }
+for i = 1, #names do
+	local cur, found, depth = env, nil, 0
+	while cur ~= nil and depth < 64 do
+		found = rawget_(cur, names[i])
+		if found ~= nil then
+			break
+		end
+		local mt = getmetatable_(cur)
+		if mt ~= nil and type_(mt) ~= "table" then
+			local name = names[i]
+			ok, found = pcall_(function()
+				return cur[name]
+			end)
+			if not ok then
+				return ANTI_TAMPER_TRAP()
+			end
+			break
+		end
+		cur = mt and rawget_(mt, "__index") or nil
+		depth = depth + 1
+	end
+	if not rawequal_(found, funcs[i]) then
+		return ANTI_TAMPER_TRAP()
+	end
+end
+
+--==========================================================================--
+-- ЧАСТЬ 2. Сам скрипт: загрузчик Luarmor
+--==========================================================================--
+
+xpcall(function(...)
+	local game_ = game
+	local gameIndex = getrawmetatable(game_).__index -- "сырой" __index у game, в обход хуков
+	local LOADER_URL = "https://api.luarmor.net/files/v4/loaders/"
+
+	-- Реакция на обнаруженное вмешательство: размножает потоки и зависает
+	local crash
+	crash = function()
+		task.spawn(function()
+			for _ = 1, 10 do
+				table.create(1)
+				task.spawn(crash)
+			end
+		end)
+		LOADER_URL = nil
+		ANTI_TAMPER_TRAP()
+	end
+
+	-- Метаметоды-ловушки: любое "подглядывание" в таблицу вызывает crash
+	local scripts = setmetatable({
+		-- ID скрипта Luarmor для всех остальных игр
+		Universal = "21698e8f55a4544bb39311aef5959f89",
+		-- ID скрипта -> { GameId, [true = запускать через актор] }
+		Specific = {
+			["dbbde2dd90c49cf837c845942fc4dd2f"] = { 115797356 },
+			["5d49599e3fbc546ebfdab6ead280a170"] = { 7970033072 },
+			["5b0df016924bca5e93ae005fcf04c179"] = { 4987856151 },
+			["00bc35c8d5928a1b645f71498f73c90d"] = { 10764885410, true },
+		},
+	}, {
+		__newindex = crash, __tostring = crash, __type = crash, __metatable = crash,
+		__pairs = crash, __ipairs = crash, __iter = crash,
+	})
+
+	-- Приманка: таблица нигде больше не используется, любое обращение к ней = crash
+	local decoy = setmetatable({
+		"ASNdoNAOJSDNioANSIKODnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKO321DnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKeqwODnoANSDO.lua",
+		"ASNdoasdNAOJSDNioAasNSIKODnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKODweqeqwnoANSDO.lua",
+		"ASNdoeqweqNAOJSDNioANSIKODnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKODnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKO321DnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKeqwODnoANSDO.lua",
+		"ASNdoasdNAOJSDNioAasNSIKODnoANSDO.lua",
+		"ASNdoNAOJSDNioANSIKODweqeqwnoANSDO.lua",
+		"ASNdoeqweqNAOJSDNioANSIKODnoANSDO.lua",
+		Specific = setmetatable({}, {
+			__index = crash, __newindex = crash, __tostring = crash, __type = crash,
+			__metatable = crash, __pairs = crash, __ipairs = crash, __iter = crash,
+		}),
+	}, {
+		__index = crash, __newindex = crash, __tostring = crash, __type = crash,
+		__metatable = crash, __pairs = crash, __ipairs = crash, __iter = crash,
+	})
+
+	local args = { ... }
+
+	if typeof(script_key) ~= "string" then
+		return error("incorrect script_key")
+	end
+
+	local function load(scriptId, useActor)
+		-- Весь стек вызовов должен быть на строке 1 (скрипт запущен как есть, одной строкой)
+		if debug.getinfo(1).currentline ~= 1
+			or debug.getinfo(2).currentline ~= 1
+			or debug.getinfo(3).currentline ~= 1 then
+			return crash()
+		end
+
+		-- true, если функция выглядит подменённой / перехваченной
+		local function isTampered(fn)
+			local _, hooked = pcall(function()
+				return isfunctionhooked(fn)
+			end)
+			if hooked == true then
+				return true
+			end
+			if not iscclosure(fn) then
+				return true
+			end
+			if isnewcclosure and isnewcclosure(fn) then
+				return true
+			end
+			if debug.getinfo(fn).what ~= "C" then
+				return true
+			end
+			local upOk, upValue = pcall(debug.getupvalue, fn, 1)
+			if upOk and upValue ~= nil then
+				return true
+			end
+			return false
+		end
+
+		for _ = 1, math.random(1, 5) do
+			if isTampered(loadstring) then
+				return crash()
+			end
+			if isTampered(request) then
+				return crash()
+			end
+			if isTampered(game.HttpGet) then
+				return crash()
+			end
+			if run_on_actor and isTampered(run_on_actor) then
+				return crash()
+			end
+
+			-- Настоящие loadstring / HttpGet на таблице просто падают с ошибкой.
+			-- Хук-логгер полезет в аргумент (tostring / индексация) — и попадётся.
+			local hookDetected = false
+			pcall(function()
+				local function trip()
+					hookDetected = true
+					crash()
+				end
+				loadstring(setmetatable({}, {
+					__index = trip, __tostring = trip, __type = trip, __metatable = crash,
+					__pairs = crash, __ipairs = crash, __iter = crash,
+				}))
+			end)
+			if hookDetected then
+				return crash()
+			end
+			pcall(function()
+				local function trip()
+					hookDetected = true
+					crash()
+				end
+				game:HttpGet(setmetatable({}, {
+					__index = trip, __tostring = trip, __type = trip, __metatable = crash,
+					__pairs = crash, __ipairs = crash, __iter = crash,
+				}))
+			end)
+			if hookDetected then
+				return crash()
+			end
+		end
+
+		-- URL и метод спрятаны за __index, чтобы их нельзя было прочитать из таблицы запроса
+		local body = request(setmetatable({}, {
+			__index = function(_, key)
+				if key == "Url" then
+					return LOADER_URL .. scriptId .. ".lua"
+				end
+				if key == "Method" then
+					return "GET"
+				end
+			end,
+			__tostring = crash, __metatable = crash,
+			__pairs = crash, __ipairs = crash, __iter = crash,
+		})).Body
+
+		if typeof(body) ~= "string" then
+			return error("Unexpected Body")
+		end
+
+		if not useActor or args[1] == true then
+			local chunk = loadstring(body)
+			getgenv()["极光计划"] = "ltd31q"
+			task.spawn(chunk)
+		else
+			-- Перезапуск этого же загрузчика внутри актора (параллельная Lua VM)
+			local actor = getactors()[1]
+			run_on_actor(actor, [[
+                script_key=({...})[2]
+                loadstring(game:HttpGet("https://raw.githubusercontent.com/ProjectAuroraDev/Aurora-Loader/refs/heads/main/Loader.lua"))(({...})[1])
+            ]], true, script_key)
+		end
+	end
+
+	local gameId = gameIndex(game_, "GameId")
+	local matched = false
+	for scriptId, entry in next, scripts.Specific do
+		if entry[1] == gameId then
+			matched = true
+			load(scriptId, entry[2])
+			break
+		end
+	end
+	if not matched and scripts.Universal then
+		load(scripts.Universal)
+	end
+
+	-- Заметание следов
+	game_ = nil
+	LOADER_URL = nil
+	for key in next, scripts do
+		scripts[key] = nil
+	end
+	scripts = nil
+	gameId = nil
+	crash = nil
+	load = nil
+end, function(...)
+	-- Любая ошибка внутри -> кик с текстом ошибки
+	game.GetService(game, "Players").LocalPlayer:Kick(...)
+end, ...)
